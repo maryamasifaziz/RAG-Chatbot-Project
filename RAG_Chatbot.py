@@ -79,13 +79,7 @@ if not api_key:
     st.warning(" Please enter your Groq API Key (or set GROQ_API_KEY in .env) ")
     st.stop()
 
-# TEMP DEBUG — remove after fixing
-st.sidebar.write("Key found:", bool(api_key))
-st.sidebar.write("Key length:", len(api_key) if api_key else 0)
-st.sidebar.write("Key start:", api_key[:12] + "..." if api_key else "NONE")
-st.sidebar.write("Key end:", "..." + api_key[-6:] if api_key else "NONE")
-st.sidebar.write("Has spaces:", " " in api_key if api_key else False)
-st.sidebar.write("Has newline:", "\n" in api_key if api_key else False)
+
 
 # ── Embeddings and LLM ────────────────────────────────────────────────────────
 embeddings = HuggingFaceEmbeddings(
