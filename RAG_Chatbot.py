@@ -13,10 +13,10 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings  # fix 1: updated import
 from langchain_chroma import Chroma
 
-# setup 
+# setup
 load_dotenv()
 st.set_page_config(page_title="RAG Q&A ", layout="wide")
 st.title("📝 RAG Q&A with Multiple PDFs + Chat History")
@@ -55,30 +55,38 @@ def save_history_to_disk(key: str, history: ChatMessageHistory) -> None:
     with open(_memory_path(key), "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
-# Sidebar 
+# Sidebar
 with st.sidebar:
     st.header("⚙️ Config")
     api_key_input = st.text_input("Groq API Key", type="password")
     st.caption("Upload PDFs -> Ask questions -> Get Answers")
 
-api_key = api_key_input or os.getenv("GROQ_API_KEY")
+# Fix 2: read from st.secrets for Streamlit Cloud, fallback to .env for local
+def _get_api_key() -> str:
+    if api_key_input:
+        return api_key_input.strip()
+    try:
+        return st.secrets["GROQ_API_KEY"].strip()
+    except Exception:
+        pass
+    val = os.getenv("GROQ_API_KEY")
+    return val.strip() if val else ""
+
+api_key = _get_api_key()
 if not api_key:
-    st.warning(" Please enter your Groq API Key (or set GROQ_API_KEY in .env) ")
+    st.warning("Please enter your Groq API Key (or set GROQ_API_KEY in Streamlit secrets / .env)")
     st.stop()
 
-# Embeddings and LLM
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    encode_kwargs={"normalize_embeddings": True}
-)
+# Fix 3: embeddings cached in session_state so model loads only once
+# (avoids re-downloading on every Streamlit rerun)
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        encode_kwargs={"normalize_embeddings": True}
+    )
+embeddings = st.session_state.embeddings
 
-llm = ChatGroq(
-    groq_api_key=api_key,
-    # model_name="llama-3.3-70b-versatile"
-    model_name="llama-3.1-8b-instant"
-)
-
-# File upload 
+# File upload
 uploaded_files = st.file_uploader(
     " 📚 Upload PDF files",
     type="pdf",
@@ -89,10 +97,9 @@ if not uploaded_files:
     st.info("Please upload one or more PDFs to begin")
     st.stop()
 
-# Doc key: fingerprint of current uploaded files 
-# We use getvalue() (always works on Streamlit UploadedFile) + filename.
-# This key scopes BOTH the vectorstore and the chat history to the exact set of documents currently uploaded. 
-# Switching documents automatically switches to that document's own history (stored permanently on disk).
+# Doc key: MD5 of actual file contents via getvalue() — always readable,
+# unlike f.read() which returns empty bytes after first access on Streamlit.
+# Scopes both vectorstore and chat history to the exact uploaded documents.
 doc_key = hashlib.md5(
     str(tuple(sorted(
         (f.name, hashlib.md5(f.getvalue()).hexdigest())
@@ -100,7 +107,7 @@ doc_key = hashlib.md5(
     ))).encode()
 ).hexdigest()[:12]
 
-# Build vectorstore only when doc_key changes 
+# Build vectorstore only when doc_key changes (new files uploaded)
 if st.session_state.get("doc_key") != doc_key:
 
     all_docs = []
@@ -127,15 +134,15 @@ if st.session_state.get("doc_key") != doc_key:
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=120)
     splits = text_splitter.split_documents(all_docs)
 
-    # In-memory vectorstore — no disk files, no Windows locking
+    # Fix 4: in-memory vectorstore — no persist_directory so no disk files,
+    # no Windows file locking, and no stale chunks from previous uploads.
     vectorstore = Chroma.from_documents(splits, embeddings)
 
     st.session_state.doc_key = doc_key
     st.session_state.vectorstore = vectorstore
     st.session_state.indexed_chunks = len(splits)
     st.session_state.num_pages = len(all_docs)
-    # Flush in-memory history cache so new doc's history loads fresh
-    st.session_state.chathistory = {}
+    st.session_state.chathistory = {}  # clear history cache on new doc
 
 retriever = st.session_state.vectorstore.as_retriever(
     search_type="mmr",
@@ -146,7 +153,7 @@ st.success(f"✅ Loaded {st.session_state.num_pages} pages from {len(uploaded_fi
 st.sidebar.write(f"🔍 Indexed {st.session_state.indexed_chunks} chunks for retrieval")
 st.sidebar.write(f"💾 Memory: `{os.path.abspath(MEMORY_DIR)}`")
 
-# Helper 
+# Helper
 def _join_docs(docs, max_chars=7000):
     chunks, total = [], 0
     for d in docs:
@@ -157,7 +164,7 @@ def _join_docs(docs, max_chars=7000):
         total += len(piece)
     return "\n\n---\n\n".join(chunks)
 
-# Prompts 
+# Prompts
 contextualize_q_prompt = ChatPromptTemplate.from_messages([
     ("system",
      "You are a search query optimizer for a document retrieval system.\n\n"
@@ -196,18 +203,17 @@ qa_prompt = ChatPromptTemplate.from_messages([
     ("human", "{input}")
 ])
 
-# Chat history (scoped per session + document) 
+# Chat history scoped per session + document
 if "chathistory" not in st.session_state:
     st.session_state.chathistory = {}
 
 def get_history(session_id: str) -> ChatMessageHistory:
-    # Each session+document combo has its own permanent history file
     scoped_key = f"{session_id}__{doc_key}"
     if scoped_key not in st.session_state.chathistory:
         st.session_state.chathistory[scoped_key] = load_history_from_disk(scoped_key)
     return st.session_state.chathistory[scoped_key]
 
-# Chat UI 
+# Chat UI
 session_id = st.text_input(" 🆔 Session ID ", value="default_session")
 user_q = st.chat_input("💬 Ask a question...")
 
@@ -215,12 +221,24 @@ if user_q:
     scoped_key = f"{session_id}__{doc_key}"
     history = get_history(session_id)
 
+    # Fix 5: LLM initialized here with fresh api_key on every question,
+    # so key changes in sidebar are always picked up immediately.
+    llm = ChatGroq(
+        groq_api_key=api_key,
+        model_name="llama-3.1-8b-instant"
+    )
+
     # 1) Rewrite question with history
     rewrite_msgs = contextualize_q_prompt.format_messages(
         chat_history=history.messages,
         input=user_q
     )
-    standalone_q = llm.invoke(rewrite_msgs).content.strip()
+
+    try:
+        standalone_q = llm.invoke(rewrite_msgs).content.strip()
+    except Exception as e:
+        st.error(f"❌ LLM error: {e}\n\nCheck your Groq API key is valid.")
+        st.stop()
 
     # 2) Retrieve chunks
     docs = retriever.invoke(standalone_q)
@@ -243,7 +261,12 @@ if user_q:
         input=user_q,
         context=context_str
     )
-    answer = llm.invoke(qa_msgs).content
+
+    try:
+        answer = llm.invoke(qa_msgs).content
+    except Exception as e:
+        st.error(f"❌ LLM error: {e}\n\nCheck your Groq API key is valid.")
+        st.stop()
 
     st.chat_message("user").write(user_q)
     st.chat_message("assistant").write(answer)
