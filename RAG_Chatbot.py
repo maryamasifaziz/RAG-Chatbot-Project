@@ -1,0 +1,264 @@
+# import (python built-ins)
+import os
+import json
+import hashlib
+import tempfile
+import streamlit as st
+from dotenv import load_dotenv
+
+## imports langchain
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+
+# setup 
+load_dotenv()
+st.set_page_config(page_title="RAG Q&A ", layout="wide")
+st.title("📝 RAG Q&A with Multiple PDFs + Chat History")
+
+# Persistent memory helpers
+MEMORY_DIR = "chat_memory"
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+def _memory_path(key: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in key)
+    return os.path.join(MEMORY_DIR, f"{safe}.json")
+
+def load_history_from_disk(key: str) -> ChatMessageHistory:
+    history = ChatMessageHistory()
+    path = _memory_path(key)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            for rec in records:
+                if rec["role"] == "human":
+                    history.add_user_message(rec["content"])
+                elif rec["role"] == "ai":
+                    history.add_ai_message(rec["content"])
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return history
+
+def save_history_to_disk(key: str, history: ChatMessageHistory) -> None:
+    records = []
+    for msg in history.messages:
+        if isinstance(msg, HumanMessage):
+            records.append({"role": "human", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            records.append({"role": "ai", "content": msg.content})
+    with open(_memory_path(key), "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+# Sidebar 
+with st.sidebar:
+    st.header("⚙️ Config")
+    api_key_input = st.text_input("Groq API Key", type="password")
+    st.caption("Upload PDFs -> Ask questions -> Get Answers")
+
+api_key = api_key_input or os.getenv("GROQ_API_KEY")
+if not api_key:
+    st.warning(" Please enter your Groq API Key (or set GROQ_API_KEY in .env) ")
+    st.stop()
+
+# Embeddings and LLM
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    encode_kwargs={"normalize_embeddings": True}
+)
+
+llm = ChatGroq(
+    groq_api_key=api_key,
+    # model_name="llama-3.3-70b-versatile"
+    model_name="llama-3.1-8b-instant"
+)
+
+# File upload 
+uploaded_files = st.file_uploader(
+    " 📚 Upload PDF files",
+    type="pdf",
+    accept_multiple_files=True
+)
+
+if not uploaded_files:
+    st.info("Please upload one or more PDFs to begin")
+    st.stop()
+
+# Doc key: fingerprint of current uploaded files 
+# We use getvalue() (always works on Streamlit UploadedFile) + filename.
+# This key scopes BOTH the vectorstore and the chat history to the exact set of documents currently uploaded. 
+# Switching documents automatically switches to that document's own history (stored permanently on disk).
+doc_key = hashlib.md5(
+    str(tuple(sorted(
+        (f.name, hashlib.md5(f.getvalue()).hexdigest())
+        for f in uploaded_files
+    ))).encode()
+).hexdigest()[:12]
+
+# Build vectorstore only when doc_key changes 
+if st.session_state.get("doc_key") != doc_key:
+
+    all_docs = []
+    tmp_paths = []
+
+    for pdf in uploaded_files:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp.write(pdf.getvalue())
+        tmp.close()
+        tmp_paths.append(tmp.name)
+
+        loader = PyPDFLoader(tmp.name)
+        docs = loader.load()
+        for d in docs:
+            d.metadata["source_file"] = pdf.name
+        all_docs.extend(docs)
+
+    for p in tmp_paths:
+        try:
+            os.unlink(p)
+        except Exception:
+            pass
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=120)
+    splits = text_splitter.split_documents(all_docs)
+
+    # In-memory vectorstore — no disk files, no Windows locking
+    vectorstore = Chroma.from_documents(splits, embeddings)
+
+    st.session_state.doc_key = doc_key
+    st.session_state.vectorstore = vectorstore
+    st.session_state.indexed_chunks = len(splits)
+    st.session_state.num_pages = len(all_docs)
+    # Flush in-memory history cache so new doc's history loads fresh
+    st.session_state.chathistory = {}
+
+retriever = st.session_state.vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 5, "fetch_k": 20}
+)
+
+st.success(f"✅ Loaded {st.session_state.num_pages} pages from {len(uploaded_files)} PDFs")
+st.sidebar.write(f"🔍 Indexed {st.session_state.indexed_chunks} chunks for retrieval")
+st.sidebar.write(f"💾 Memory: `{os.path.abspath(MEMORY_DIR)}`")
+
+# Helper 
+def _join_docs(docs, max_chars=7000):
+    chunks, total = [], 0
+    for d in docs:
+        piece = d.page_content
+        if total + len(piece) > max_chars:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    return "\n\n---\n\n".join(chunks)
+
+# Prompts 
+contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a search query optimizer for a document retrieval system.\n\n"
+     "Your job: given the conversation history and the user's latest message, produce ONE "
+     "precise, self-contained search query suitable for semantic search over documents.\n\n"
+     "Rules:\n"
+     "- Resolve ALL pronouns and references ('it', 'this', 'that approach', 'the algorithm', "
+     "'the previous one') by replacing them with the actual noun/concept from the chat history.\n"
+     "- If the user is asking a follow-up (e.g. 'explain more', 'give an example', 'why?'), "
+     "expand it into a full question using the topic from the previous exchange.\n"
+     "- Keep the query focused and specific — avoid vague terms.\n"
+     "- Output ONLY the rewritten query. No explanation, no punctuation at the end."),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}")
+])
+
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an expert assistant that answers questions using ONLY the provided document context.\n\n"
+     "ANSWER QUALITY RULES:\n"
+     "1. Structure your answer clearly — use headings, bullet points, or numbered steps when the "
+     "topic has multiple parts or a sequence.\n"
+     "2. Be thorough and detailed. Do not give one-line answers. Explain the 'why' and 'how', "
+     "not just the 'what'.\n"
+     "3. Use examples, figures, or data from the context to support your answer when available.\n"
+     "4. For follow-up questions, build on the previous answer — do not repeat what was already "
+     "explained unless the user asks for a recap.\n\n"
+     "SCOPE RULES:\n"
+     "5. Use ONLY the provided context. Do NOT use outside knowledge.\n"
+     "6. If the context partially covers the question, answer what is covered and explicitly state "
+     "what is not addressed in the documents.\n"
+     "7. Only reply 'Out of scope - not found in provided documents.' if the context has "
+     "absolutely zero relevant information.\n\n"
+     "Context:\n{context}"),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}")
+])
+
+# Chat history (scoped per session + document) 
+if "chathistory" not in st.session_state:
+    st.session_state.chathistory = {}
+
+def get_history(session_id: str) -> ChatMessageHistory:
+    # Each session+document combo has its own permanent history file
+    scoped_key = f"{session_id}__{doc_key}"
+    if scoped_key not in st.session_state.chathistory:
+        st.session_state.chathistory[scoped_key] = load_history_from_disk(scoped_key)
+    return st.session_state.chathistory[scoped_key]
+
+# Chat UI 
+session_id = st.text_input(" 🆔 Session ID ", value="default_session")
+user_q = st.chat_input("💬 Ask a question...")
+
+if user_q:
+    scoped_key = f"{session_id}__{doc_key}"
+    history = get_history(session_id)
+
+    # 1) Rewrite question with history
+    rewrite_msgs = contextualize_q_prompt.format_messages(
+        chat_history=history.messages,
+        input=user_q
+    )
+    standalone_q = llm.invoke(rewrite_msgs).content.strip()
+
+    # 2) Retrieve chunks
+    docs = retriever.invoke(standalone_q)
+
+    if not docs:
+        answer = "Out of scope — not found in provided documents."
+        st.chat_message("user").write(user_q)
+        st.chat_message("assistant").write(answer)
+        history.add_user_message(user_q)
+        history.add_ai_message(answer)
+        save_history_to_disk(scoped_key, history)
+        st.stop()
+
+    # 3) Build context string
+    context_str = _join_docs(docs)
+
+    # 4) Generate answer
+    qa_msgs = qa_prompt.format_messages(
+        chat_history=history.messages,
+        input=user_q,
+        context=context_str
+    )
+    answer = llm.invoke(qa_msgs).content
+
+    st.chat_message("user").write(user_q)
+    st.chat_message("assistant").write(answer)
+
+    history.add_user_message(user_q)
+    history.add_ai_message(answer)
+    save_history_to_disk(scoped_key, history)
+
+    # Debug panels
+    with st.expander("🧪 Debug: Rewritten Query & Retrieval"):
+        st.write("**Rewritten (standalone) query:**")
+        st.code(standalone_q or "(empty)", language="text")
+        st.write(f"**Retrieved {len(docs)} chunk(s).**")
+
+    with st.expander("📑 Retrieved Chunks"):
+        for i, doc in enumerate(docs, 1):
+            st.markdown(f"**{i}. {doc.metadata.get('source_file','Unknown')} (p{doc.metadata.get('page','?')})**")
+            st.write(doc.page_content[:500] + ("..." if len(doc.page_content) > 500 else ""))
