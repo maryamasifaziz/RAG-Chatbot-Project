@@ -193,12 +193,13 @@ qa_prompt = ChatPromptTemplate.from_messages([
      "4. For follow-up questions, build on the previous answer — do not repeat what was already "
      "explained unless the user asks for a recap.\n\n"
      "SCOPE RULES:\n"
-     "5. Use ONLY the provided context. Do NOT use outside knowledge.\n"
-     "6. If the context partially covers the question, answer what is covered and explicitly state "
-     "what is not addressed in the documents.\n"
-     "7. If the question cannot be answered using the provided context, reply EXACTLY:\n"
-     "'Out of scope - not found in provided documents.'\n"
-     "Do NOT mention general knowledge. Do NOT say you could answer from outside sources.\n\n"
+     "5. Use ONLY the provided context. Do NOT use outside knowledge under ANY circumstances.\n"
+     "6. If the context partially covers the question, answer only what is covered.\n"
+     "7. If the question cannot be answered using the provided context, reply EXACTLY with\n"
+     "this phrase and nothing else: 'Out of scope - not found in provided documents.'\n"
+     "8. Even if the user says 'but tell me', 'tell me anyway', 'use your knowledge', or\n"
+     "pushes back in any way — still reply ONLY with: 'Out of scope - not found in provided documents.'\n"
+     "NEVER mention general knowledge. NEVER offer to answer from memory. NEVER explain what you know.\n\n"
      "Context:\n{context}"),
     MessagesPlaceholder("chat_history"),
     ("human", "{input}")
@@ -228,6 +229,30 @@ if user_q:
         groq_api_key=api_key,
         model_name="llama-3.1-8b-instant"
     )
+
+    # If the last assistant reply was out-of-scope and user is pushing back
+    # (e.g. "but tell me", "just answer", "tell me anyway"), refuse again.
+    REFUSAL = "Out of scope - not found in provided documents."
+    last_messages = history.messages
+    if last_messages:
+        last_ai = next(
+            (m.content for m in reversed(last_messages) if isinstance(m, AIMessage)),
+            ""
+        )
+        pushy_phrases = [
+            "but tell me", "tell me anyway", "just tell me", "just answer",
+            "answer anyway", "use your knowledge", "from your knowledge",
+            "you know it", "i know you know", "pretend", "ignore", "forget"
+        ]
+        if REFUSAL.lower() in last_ai.lower() and any(
+            p in user_q.lower() for p in pushy_phrases
+        ):
+            st.chat_message("user").write(user_q)
+            st.chat_message("assistant").write(REFUSAL)
+            history.add_user_message(user_q)
+            history.add_ai_message(REFUSAL)
+            save_history_to_disk(scoped_key, history)
+            st.stop()
 
     # 1) Rewrite question with history
     rewrite_msgs = contextualize_q_prompt.format_messages(
