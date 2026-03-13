@@ -16,6 +16,14 @@
 
 ---
 
+## 📸 Screenshots
+![Dashboard Screenshot 1](images/dashboard1.png)
+![Dashboard Screenshot 2](images/dashboard2.png)
+![Dashboard Screenshot 3](images/dashboard3.png)
+![Dashboard Screenshot 4](images/dashboard4.png)
+
+---
+
 ## 🧠 Overview
 Upload multiple PDFs and ask questions in natural language. The chatbot uses a **two-stage RAG pipeline** — first rewriting your query using chat history for better retrieval, then generating grounded answers using **Groq's LLaMA-3.1-8b** model. Answers are strictly limited to document content — no hallucinations, no outside knowledge.
 
